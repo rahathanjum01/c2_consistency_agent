@@ -1,0 +1,6 @@
+flask
+pytesseract
+pillow
+rapidfuzz
+python-dateutil
+reportlab
