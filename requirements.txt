@@ -4,3 +4,4 @@ pillow
 rapidfuzz
 python-dateutil
 reportlab
+easyocr
