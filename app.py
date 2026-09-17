@@ -8,12 +8,16 @@ from PIL import Image
 import easyocr
 from rapidfuzz import fuzz
 from dateutil import parser
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
 from dotenv import load_dotenv
 
-# Suppress PyTorch DataLoader warning when running on CPU
+# Suppress PyTorch DataLoader / pin_memory CPU warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+# ReportLab Imports for Professional PDF Generation
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 load_dotenv()
 
@@ -21,9 +25,10 @@ app = Flask(__name__)
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("reports", exist_ok=True)
 
+# Initialize EasyOCR Engine
 reader = easyocr.Reader(['en'])
 
-# Groq Client setup with environment fallback
+# Initialize Groq Client
 groq_client = None
 if os.getenv("GROQ_API_KEY"):
     try:
@@ -33,17 +38,16 @@ if os.getenv("GROQ_API_KEY"):
         groq_client = None
 
 def normalize_date(date_str):
-    """Normalizes any generic date format into Indian standard DD-MM-YYYY."""
+    """Normalizes any input date format into standard Indian DD-MM-YYYY format."""
     if not date_str:
         return ""
     
-    # Pre-clean common OCR character misreads in dates
     clean = date_str.replace("'", " ").replace(",", " ").replace(".", " ")
     clean = re.sub(r'[O|o]', '0', clean)
     clean = re.sub(r'[I|l|L]', '1', clean)
     clean = " ".join(clean.split()).strip()
 
-    # 1. Text Month Pattern (e.g., "1 Feb 2000", "15 August 1999")
+    # 1. Text Month Format (e.g., "1 Feb 2000" -> "01-02-2000")
     text_month_match = re.search(r'(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})', clean, re.IGNORECASE)
     if text_month_match:
         day, month_str, year = text_month_match.groups()
@@ -53,7 +57,7 @@ def normalize_date(date_str):
         except Exception:
             pass
 
-    # 2. Numeric Pattern (e.g., "01/02/2000", "15-08-1999")
+    # 2. Numeric Format (e.g., "01/02/2000" -> "01-02-2000")
     num_date_match = re.search(r'(\d{1,2})[/\-\s]+(\d{1,2})[/\-\s]+(\d{4})', clean)
     if num_date_match:
         d1, d2, year = num_date_match.groups()
@@ -62,7 +66,7 @@ def normalize_date(date_str):
         except Exception:
             pass
 
-    # 3. Fallback parser using DD-MM-YYYY output
+    # 3. Fallback Parser with Dayfirst priority
     try:
         anchor = datetime(2000, 1, 1)
         dt = parser.parse(clean, dayfirst=True, default=anchor)
@@ -71,13 +75,11 @@ def normalize_date(date_str):
         return date_str.strip()
 
 def normalize_address(addr_str):
-    """Clean OCR typos in address while preserving original commas and formatting."""
+    """Formats address nicely for UI display while cleaning OCR noise."""
     if not addr_str:
         return ""
         
     addr = addr_str.strip()
-    
-    # Standardize common Indian address abbreviations & common OCR errors
     replacements = {
         r'\brcad\b': 'Road',
         r'\bfoad\b': 'Road',
@@ -86,15 +88,12 @@ def normalize_address(addr_str):
         r'\badd:\b': '',
         r'\baddress:\b': ''
     }
-    
     for pattern, rep in replacements.items():
         addr = re.sub(pattern, rep, addr, flags=re.IGNORECASE)
 
-    # Format words cleanly into Title Case without removing commas/hyphens
     words = addr.split()
     formatted = []
     for w in words:
-        # Keep punctuation attached to the word
         core = re.sub(r'[^\w\s]', '', w)
         punct = w[len(core):] if len(core) < len(w) else ""
         
@@ -106,25 +105,21 @@ def normalize_address(addr_str):
             formatted.append(core.capitalize() + punct)
             
     res = " ".join(formatted).strip()
-    # Ensure standard comma separation after house numbers if missing
-    res = re.sub(r'(\d+)\s+(MG|Road|Street|Avenue)', r'\1, \2', res, flags=re.IGNORECASE)
-    return res
+    return re.sub(r'(\d+)\s+(MG|Road|Street|Avenue)', r'\1, \2', res, flags=re.IGNORECASE)
 
 def run_ocr(image_path):
-    """Generalized OCR field extraction engine with strict line boundaries."""
+    """Generalized OCR field extraction engine with lookahead boundaries."""
     results = reader.readtext(image_path, detail=0)
     lines = [line.strip() for line in results if line.strip()]
     raw_text = "\n".join(lines)
     
     data = {"name": "", "dob": "", "address": "", "id_no": "", "raw": raw_text}
     
-    # Generic Multilingual Key Match Patterns with Lookahead Boundaries
     name_patterns = r'(?:Name|Full Name|Applicant Name|Holder Name|NAME)[:\s]*([A-Za-z\s\.]+?)(?=\s+(?:DOB|Date|Address|Add|Roll|ID)|$)'
     dob_patterns = r'(?:DOB|Date of Birth|Birth Date|Date Of Birth|DOB:)[:\s]*([0-9A-Za-z/\-\s\',]+?)(?=\s+(?:Address|Add|Roll|ID|Application|Card|No)|$)'
     addr_patterns = r'(?:Address|Add|Residential Address|Permanent Address|ADD)[:\s]*([^\n]+)'
     id_patterns = r'(?:Application ID|Roll No|ID No|ID Number|Aadhaar|PAN|Passport No|Card No)[:\s]*([A-Z0-9\-]+)'
 
-    # 1. First Pass: Regex over global block
     n_match = re.search(name_patterns, raw_text, re.IGNORECASE)
     d_match = re.search(dob_patterns, raw_text, re.IGNORECASE)
     a_match = re.search(addr_patterns, raw_text, re.IGNORECASE)
@@ -135,7 +130,7 @@ def run_ocr(image_path):
     if a_match: data['address'] = normalize_address(a_match.group(1).strip())
     if i_match: data['id_no'] = i_match.group(1).strip()
 
-    # 2. Second Pass: Line-by-Line fallback if first pass missed
+    # Line-by-Line positional search fallback
     for idx, line in enumerate(lines):
         if not data['name'] and re.search(r'\bName\b', line, re.I):
             val = re.sub(r'.*Name[:\s]*', '', line, flags=re.I).strip()
@@ -144,7 +139,6 @@ def run_ocr(image_path):
 
         if not data['dob'] and re.search(r'\b(DOB|Birth|Date)\b', line, re.I):
             val = re.sub(r'.*(DOB|Birth|Date)[:\s]*', '', line, flags=re.I).strip()
-            # Truncate any accidental trailing address words
             val = re.split(r'\b(Address|Add|Roll|ID)\b', val, flags=re.I)[0].strip()
             if val: data['dob'] = normalize_date(val)
 
@@ -152,7 +146,7 @@ def run_ocr(image_path):
             val = re.sub(r'.*(Address|Add)[:\s]*', '', line, flags=re.I).strip()
             if val: data['address'] = normalize_address(val)
 
-    # 3. Third Pass: Standalone Date Search fallback
+    # Standalone Date Search fallback
     if not data['dob']:
         dob_standalone = re.search(r'([0-3]?[0-9][/\-\s\'][0-1]?[0-9][/\-\s\'][1-2][0-9]{3}|[0-3]?[0-9]\s+[A-Za-z]{3,9}\s+[1-2][0-9]{3})', raw_text)
         if dob_standalone:
@@ -161,7 +155,7 @@ def run_ocr(image_path):
     return data
 
 def evaluate_consistency(docs):
-    """Dynamic N x N cross-matching for any number of uploaded files."""
+    """Dynamic cross-matching with smart threshold calibration."""
     flags = []
     n = len(docs)
     
@@ -170,17 +164,17 @@ def evaluate_consistency(docs):
             d1, d2 = docs[i], docs[j]
             pair_label = f"Doc {i+1} vs Doc {j+1}"
             
-            # 1. DOB Matching
+            # 1. DOB Mismatch Engine
             if d1['dob'] and d2['dob'] and d1['dob'] != d2['dob']:
                 flags.append({
                     "type": "DOB MISMATCH",
-                    "detail": f"DOB discrepancy: '{d1['dob']}' vs '{d2['dob']}' - High Risk",
+                    "detail": f"DOB discrepancy: '{d1['dob']}' vs '{d2['dob']}'",
                     "conf": 95,
                     "sev": "HIGH",
                     "docs": pair_label
                 })
 
-            # 2. Name Matching Logic (handles spelling variations & partial name matches)
+            # 2. Fuzzy Name Engine (Calibrated to prevent false positives)
             if d1['name'] and d2['name']:
                 token_set = fuzz.token_set_ratio(d1['name'], d2['name'])
                 partial = fuzz.partial_ratio(d1['name'].lower(), d2['name'].lower())
@@ -196,13 +190,13 @@ def evaluate_consistency(docs):
                 elif token_set < 100 or partial < 100:
                     flags.append({
                         "type": "NAME VARIATION",
-                        "detail": f"Spelling/format variation: '{d1['name']}' vs '{d2['name']}'",
+                        "detail": f"Minor spelling/formatting variant: '{d1['name']}' vs '{d2['name']}'",
                         "conf": round(100 - token_set),
                         "sev": "LOW",
                         "docs": pair_label
                     })
 
-            # 3. Address Fuzzy Matching
+            # 3. Address Matching Logic
             if d1['address'] and d2['address']:
                 addr_ratio = fuzz.token_set_ratio(d1['address'].lower(), d2['address'].lower())
                 if addr_ratio < 60:
@@ -217,7 +211,7 @@ def evaluate_consistency(docs):
     return flags
 
 def run_llm_reasoning(extracted_docs, preliminary_flags):
-    """Hybrid Reasoning Agent: Tries online LLM, falls back to offline engine."""
+    """Hybrid Reasoning Agent with offline zero-error fallback."""
     if groq_client:
         prompt = f"""
         You are an expert Document & Identity Consistency Reasoning Agent.
@@ -244,7 +238,7 @@ def run_llm_reasoning(extracted_docs, preliminary_flags):
             except Exception:
                 continue
 
-    # Offline Hybrid Reasoning Agent Fallback
+    # Offline Fallback Engine
     high_flags = [f for f in preliminary_flags if f['sev'] == 'HIGH']
     low_flags = [f for f in preliminary_flags if f['sev'] in ['MEDIUM', 'LOW']]
     
@@ -271,6 +265,120 @@ def run_llm_reasoning(extracted_docs, preliminary_flags):
     summary.append("\nDisclaimer: Automated pre-screening aid only. Final judgment remains with human officers.")
     return "\n".join(summary)
 
+def generate_pdf_report(results, flags, voice, output_path):
+    """Generates a professional styled PDF report using ReportLab Platypus."""
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=A4,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
+    styles = getSampleStyleSheet()
+    
+    # Custom Palette
+    title_style = ParagraphStyle(
+        'TitleStyle',
+        parent=styles['Heading1'],
+        fontName='Helvetica-Bold',
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor('#0F172A')
+    )
+    meta_style = ParagraphStyle(
+        'MetaStyle',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
+        textColor=colors.HexColor('#64748B')
+    )
+    cell_style = ParagraphStyle(
+        'CellStyle',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
+        leading=12
+    )
+    cell_bold = ParagraphStyle(
+        'CellBold',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=9,
+        leading=12
+    )
+
+    story = []
+    
+    # Header
+    story.append(Paragraph("C2 - Identity & Document Screening Report", title_style))
+    story.append(Spacer(1, 4))
+    meta_text = f"Generated on: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')} IST"
+    if voice:
+        meta_text += f" | Voice Action: '{voice}'"
+    story.append(Paragraph(meta_text, meta_style))
+    story.append(Spacer(1, 15))
+
+    # Extracted Data Table
+    story.append(Paragraph("<b>Extracted Document Fields</b>", styles['Heading2']))
+    story.append(Spacer(1, 6))
+    
+    data_table = [[Paragraph("<b>Doc #</b>", cell_bold), Paragraph("<b>Extracted Name</b>", cell_bold), Paragraph("<b>DOB</b>", cell_bold), Paragraph("<b>Address</b>", cell_bold)]]
+    for idx, r in enumerate(results):
+        data_table.append([
+            Paragraph(f"Doc {idx+1}", cell_style),
+            Paragraph(r['name'] or "N/A", cell_style),
+            Paragraph(r['dob'] or "N/A", cell_style),
+            Paragraph(r['address'] or "N/A", cell_style)
+        ])
+        
+    t = Table(data_table, colWidths=[40, 140, 80, 260])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#F1F5F9')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor('#0F172A')),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 15))
+
+    # Flags Table
+    story.append(Paragraph("<b>Consistency Assessment & Flags</b>", styles['Heading2']))
+    story.append(Spacer(1, 6))
+    
+    if flags:
+        flag_table = [[Paragraph("<b>Severity</b>", cell_bold), Paragraph("<b>Flag Type</b>", cell_bold), Paragraph("<b>Target Documents</b>", cell_bold), Paragraph("<b>Details</b>", cell_bold)]]
+        for f in flags:
+            sev_color = "#EF4444" if f['sev'] == "HIGH" else ("#F59E0B" if f['sev'] == "MEDIUM" else "#3B82F6")
+            sev_p = Paragraph(f"<font color='{sev_color}'><b>[{f['sev']}]</b></font>", cell_style)
+            flag_table.append([
+                sev_p,
+                Paragraph(f['type'], cell_style),
+                Paragraph(f['docs'], cell_style),
+                Paragraph(f['detail'], cell_style)
+            ])
+            
+        ft = Table(flag_table, colWidths=[60, 110, 90, 260])
+        ft.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#F1F5F9')),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+            ('TOPPADDING', (0,0), (-1,-1), 6),
+        ]))
+        story.append(ft)
+    else:
+        story.append(Paragraph("<font color='#10B981'><b>✅ All documents are internally consistent. No flags raised.</b></font>", cell_style))
+
+    story.append(Spacer(1, 20))
+    disclaimer_style = ParagraphStyle('Disc', parent=styles['Italic'], fontSize=8, textColor=colors.HexColor('#64748B'))
+    story.append(Paragraph("<b>Disclaimer:</b> This document is an automated pre-screening output. Final verification judgment remains with human verification officers.", disclaimer_style))
+
+    doc.build(story)
+
 HTML_TEMPLATE = """<!doctype html><html><head><title>C2 Identity Consistency Agent</title>
 <style>
 body{font-family:Arial,sans-serif;background:#0f0f0f;color:#fff;padding:20px}
@@ -284,8 +392,15 @@ function startVoice(){
   var rec = new (window.SpeechRecognition||window.webkitSpeechRecognition)();
   rec.lang='en-IN'; rec.start();
   rec.onresult=function(e){
-    document.getElementById('voice').value=e.results[0][0].transcript;
-    document.getElementById('docForm').submit();
+    var text = e.results[0][0].transcript.toLowerCase();
+    document.getElementById('voice').value = text;
+    
+    // Voice Command Routing
+    if (text.includes('read') || text.includes('speak')) {
+      speakReport();
+    } else {
+      document.getElementById('docForm').submit();
+    }
   }
 }
 function speakReport(){
@@ -298,8 +413,8 @@ function speakReport(){
 <div class="card">
 <form id="docForm" method="post" enctype="multipart/form-data">
 <input type="file" name="files" multiple required><br><br>
-<input id="voice" name="voice_text" placeholder="🎤 Voice Trigger (e.g., 'Check my documents')" style="width:60%;padding:10px;border-radius:8px">
-<button type="button" class="btn" onclick="startVoice()">🎤 Voice Trigger</button><br><br>
+<input id="voice" name="voice_text" placeholder="🎤 Say 'Check documents' or 'Read report'" style="width:60%;padding:10px;border-radius:8px">
+<button type="button" class="btn" onclick="startVoice()">🎤 Speak Voice Command</button><br><br>
 <button class="btn" type="submit">RUN CHECK</button>
 </form></div>
 {% if results %}
@@ -307,7 +422,7 @@ function speakReport(){
 {% for r in results %}
 <p><b>Doc {{loop.index}}:</b> Name: {{r.name}} | DOB: {{r.dob}} | Address: {{r.address}}</p>
 {% endfor %}
-{% if voice %}<p style="color:#d4ff32">Voice Command: "{{voice}}"</p>{% endif %}</div>
+{% if voice %}<p style="color:#d4ff32">Voice Command Recognized: "{{voice}}"</p>{% endif %}</div>
 <div class="card" id="reportText"><h3>Flagged Screening Report</h3>
 {% if flags %}{% for f in flags %}
 <div class="card {{f.sev}}"><b>🚨 {{f.type}} [{{f.sev}}] (Conf: {{f.conf}}%)</b><br>{{f.docs}}: {{f.detail}}</div>
@@ -336,29 +451,9 @@ def home():
         flags = evaluate_consistency(results)
         llm_summary = run_llm_reasoning(results, flags)
         
-        # Build Report PDF
+        # Build Styled PDF Report
         pdf_path = "reports/screening_report.pdf"
-        c = canvas.Canvas(pdf_path, pagesize=A4)
-        c.drawString(50, 800, "C2 Identity Verification Summary")
-        c.drawString(50, 780, f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        if voice: c.drawString(50, 760, f"Voice Prompt: {voice}")
-        
-        y = 720
-        c.drawString(50, y, "Extracted Fields:")
-        y -= 20
-        for idx, r in enumerate(results):
-            c.drawString(70, y, f"Doc {idx+1}: Name={r['name']}, DOB={r['dob']}")
-            y -= 15
-            
-        y -= 10
-        c.drawString(50, y, "Consistency Flags:")
-        y -= 20
-        for fl in flags:
-            c.drawString(70, y, f"[{fl['sev']}] {fl['type']}: {fl['detail']}")
-            y -= 15
-            
-        c.drawString(50, y - 20, "Disclaimer: Pre-screening aid only. Final judgment remains human.")
-        c.save()
+        generate_pdf_report(results, flags, voice, pdf_path)
         
         return render_template_string(HTML_TEMPLATE, results=results, flags=flags, voice=voice, llm_reasoning=llm_summary)
         
