@@ -1,1 +1,5 @@
 .env
+venv/
+uploads/
+reports/
+__pycache__/
