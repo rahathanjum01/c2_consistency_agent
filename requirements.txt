@@ -1,7 +1,8 @@
 flask
-pytesseract
+easyocr
 pillow
 rapidfuzz
 python-dateutil
 reportlab
-easyocr
+python-dotenv
+groq
